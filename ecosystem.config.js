@@ -2,7 +2,7 @@ module.exports = {
     apps: [{
         name: "bgp-query-bot",
         script: "bun",
-        args: "run dist/index.js",
+        args: "run start",
         env: {
             NODE_ENV: "production",
         }

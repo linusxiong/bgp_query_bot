@@ -1,5 +1,9 @@
 import { Bot, Context, CommandContext } from "grammy";
-
+import { limit } from "@grammyjs/ratelimiter";
+import {
+    ignoreOld,
+} from "grammy-middlewares";
+import {autoRetry} from "@grammyjs/auto-retry";
 // Operator mappings and interfaces remain the same
 const OPERATOR_MAPPING: Record<string, string> = {
     "5511": "Orange",
@@ -28,7 +32,7 @@ const OPERATOR_MAPPING: Record<string, string> = {
     "7018": "AT&T",
     "2497": "IIJ",
     "4766": "Korea Telecom",
-    "577": "Bell Canada",
+    "577" : "Bell Canada",
     "3303": "Swisscom",
     "6453": "TATA Communications",
     "6762": "Sparkle",
@@ -36,7 +40,14 @@ const OPERATOR_MAPPING: Record<string, string> = {
     "4826": "VOCUS",
     "6939": "HE",
     "9299": "Philippine Long Distance",
-    "4755": "TATA India"
+    "4755": "TATA India",
+    "906" : "DMIT",
+    "54574" : "DMIT",
+    "32519" : "DMIT",
+    "57695" : "Misaka",
+    "917" : "Misaka",
+    "969" : "Misaka",
+    "35487" : "Misaka",
 };
 
 interface ASNInfo {
@@ -183,8 +194,21 @@ async function fetchBGPToolsData(cidr: string): Promise<BGPResponse> {
     };
 }
 
-// Parallel fetch function
-async function fetchAllSources(cidr: string): Promise<CombinedResults> {
+async function fetchAllSources(input: string): Promise<CombinedResults> {
+    let cidr: string;
+
+    // Check if input is already a valid CIDR
+    if (isValidIPv4CIDR(input) || isValidIPv6CIDR(input)) {
+        cidr = input;
+    } else {
+        // If not, try to get the correct CIDR from BGP.tools
+        try {
+            cidr = await getCorrectCIDR(input);
+        } catch (error) {
+            throw new Error(`Invalid input: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+
     const results: CombinedResults = {};
 
     const [heResult, bgpToolsResult] = await Promise.allSettled([
@@ -247,9 +271,13 @@ async function analyzeBGPData(cidr: string): Promise<string> {
             });
         }
 
+        // Check if we have any valid routes
+        if (allRoutes.length === 0) {
+            return `查询CIDR段: ${cidr}\n未找到任何有效的BGP路由信息。`;
+        }
+
         const totalPaths = allRoutes.length;
 
-        // Rest of the analysis remains similar to original code
         const tierStats = {
             direct: new Map<string, number>(),
             tier1: new Map<string, number>(),
@@ -257,6 +285,7 @@ async function analyzeBGPData(cidr: string): Promise<string> {
             tier3: new Map<string, number>()
         };
 
+        // Process each route with safety checks
         allRoutes.forEach(route => {
             if (!route.aspath?.[0]?.asns) return;
 
@@ -310,34 +339,100 @@ async function analyzeBGPData(cidr: string): Promise<string> {
             ...convertToSortedArray(tierStats.tier3, 'T3')
         ];
 
-        // Build enhanced message with source information
-        const targetASN = allRoutes[0].aspath[0].asns.at(-1)?.toString() || '';
-        const asnInfo = allASNMap[targetASN];
+        // Safely get target ASN information
+        let targetASN = '';
+        let asnInfo: ASNInfo | undefined;
+
+        if (allRoutes[0]?.aspath?.[0]?.asns?.length > 0) {
+            targetASN = allRoutes[0].aspath[0].asns.at(-1)?.toString() || '';
+            asnInfo = allASNMap[targetASN];
+        }
 
         const message = [
             `查询CIDR段: ${cidr}`,
-            `ASN号: ${targetASN}`,
-            `ASN名: ${asnInfo?.org || asnInfo?.descr || 'Unknown'}`,
-            `地区: ${asnInfo?.country || 'Unknown'}`,
+            targetASN ? `ASN号: ${targetASN}` : '未找到ASN信息',
+            asnInfo ? `ASN名: ${asnInfo.org || asnInfo.descr || 'Unknown'}` : '',
+            asnInfo ? `地区: ${asnInfo.country || 'Unknown'}` : '',
             '',
-            '数据源统计:',
+            '\n数据源统计:',
             `- HE.net: ${heCount > 0 ? `${heCount}条路由` : '获取失败'}`,
             `- BGP.tools: ${bgpToolsCount > 0 ? `${bgpToolsCount}条路由` : '获取失败'}`,
             `- 合并去重后: ${totalPaths}条路由`,
             '',
-            '路由分析:',
+            '\n路由分析:',
             ...allPaths.slice(0, 15).map(({path, percentage, tier}) =>
                 `${percentage.toFixed(1)}% [${tier}] ${path}`
             )
-        ].join('\n');
+        ].filter(Boolean).join('\n');
 
         return message;
 
     } catch (error) {
         console.error('Error analyzing BGP data:', error);
-        return 'Error analyzing BGP data. Please try again later.';
+        return `查询出错: ${error instanceof Error ? error.message : '未知错误'}\n请稍后重试。`;
     }
 }
+
+// Validate if string is IPv4 CIDR
+function isValidIPv4CIDR(cidr: string): boolean {
+    const parts = cidr.split('/');
+    if (parts.length !== 2) return false;
+
+    const [ip, prefix] = parts;
+    const ipParts = ip.split('.');
+    const prefixNum = parseInt(prefix);
+
+    if (ipParts.length !== 4) return false;
+    if (isNaN(prefixNum) || prefixNum < 0 || prefixNum > 32) return false;
+
+    return ipParts.every(part => {
+        const num = parseInt(part);
+        return !isNaN(num) && num >= 0 && num <= 255;
+    });
+}
+
+// Validate if string is IPv6 CIDR
+function isValidIPv6CIDR(cidr: string): boolean {
+    const parts = cidr.split('/');
+    if (parts.length !== 2) return false;
+
+    const [ip, prefix] = parts;
+    const prefixNum = parseInt(prefix);
+
+    if (isNaN(prefixNum) || prefixNum < 0 || prefixNum > 128) return false;
+
+    // Basic IPv6 validation using regex
+    const ipv6Regex = /^(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?:(?::[0-9a-fA-F]{1,4}){1,6})|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(?::[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(?:ffff(?::0{1,4}){0,1}:){0,1}(?:(?:25[0-5]|(?:2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(?:25[0-5]|(?:2[0-4]|1{0,1}[0-9]){0,1}[0-9])|(?:[0-9a-fA-F]{1,4}:){1,4}:(?:(?:25[0-5]|(?:2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(?:25[0-5]|(?:2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$/;
+
+    return ipv6Regex.test(ip);
+}
+
+// Function to get correct CIDR from BGP.tools
+async function getCorrectCIDR(input: string): Promise<string> {
+    try {
+        const response = await fetch(`https://bgp.tools/prefix/${input}`, {
+            method: 'GET',
+            redirect: 'manual', // Don't automatically follow redirects
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0'
+            }
+        });
+
+        if (response.status === 307) {
+            const location = response.headers.get('location');
+            if (location) {
+                const match = location.match(/\/prefix\/([\d\.:\/a-fA-F]+)/);
+                if (match && match[1]) {
+                    return match[1];
+                }
+            }
+        }
+        throw new Error('Unable to determine correct CIDR');
+    } catch (error) {
+        throw new Error(`Error getting correct CIDR: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+}
+
 
 // Bot setup
 const token = Bun.env.BOT_TOKEN;
@@ -348,7 +443,16 @@ if (!token) {
 
 const bot = new Bot(token);
 
-bot.command("start", async (ctx: CommandContext<Context>) => {
+const limiter = limit({
+    timeFrame: 2000,
+    limit: 1,
+
+    onLimitExceeded: async (ctx) => {
+        await ctx.reply("请求过快，请稍后重试！");
+    },
+});
+
+bot.command("start", limiter, async (ctx: CommandContext<Context>) => {
     await ctx.reply(
         "欢迎使用 BGP 路由查询机器人!\n" +
         "使用方法: /bgpmp <CIDR>\n" +
@@ -356,7 +460,7 @@ bot.command("start", async (ctx: CommandContext<Context>) => {
     );
 });
 
-bot.command("bgpmp", async (ctx: CommandContext<Context>) => {
+bot.command("bgpmp", limiter, async (ctx: CommandContext<Context>) => {
     const cidr = ctx.match as string;
 
     if (!cidr) {
@@ -398,4 +502,9 @@ bot.catch((err: Error) => {
 });
 
 console.log("Starting bot...");
+
+bot.use(limiter)
+bot.use(ignoreOld());
+bot.api.config.use(autoRetry())
+
 bot.start();
